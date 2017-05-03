@@ -19,9 +19,9 @@ angular.module('forceng', [])
 
     // The force.com API version to use.
     // To override default, pass apiVersion in init(props)
-      apiVersion = 'v38.0',
+      apiVersion = 'v39.0',
 
-    // Keep track of OAuth data (access_token, refresh_token, and instance_url)
+    // Keep track of OAuth data (access_token, refresh_token, instance_url, user_id and org_id)
       oauth,
 
     // By default we store token in sessionStorage. This can be overridden in init()
@@ -188,15 +188,6 @@ angular.module('forceng', [])
      */
     function init(params) {
 
-      if (useCordova) {
-        document.addEventListener("deviceready", function () {
-          networkPlugin = cordova.require("com.salesforce.plugin.network");
-          if (!networkPlugin) {
-            console.log('Salesforce Mobile SDK Network plugin not available');
-          }
-        });
-      }
-
       if (params) {
         appId = params.appId || appId;
         apiVersion = params.apiVersion || apiVersion;
@@ -204,6 +195,7 @@ angular.module('forceng', [])
         oauthCallbackURL = params.oauthCallbackURL || oauthCallbackURL;
         proxyURL = params.proxyURL || proxyURL;
         useProxy = params.useProxy === undefined ? useProxy : params.useProxy;
+        useCordova = params.useCordova === undefined ? useCordova : params.useCordova;
 
         if (params.accessToken) {
           if (!oauth) oauth = {};
@@ -218,6 +210,16 @@ angular.module('forceng', [])
         if (params.refreshToken) {
           if (!oauth) oauth = {};
           oauth.refresh_token = params.refreshToken;
+        }
+
+        if (params.userId) {
+          if (!oauth) oauth = {};
+          oauth.user_id = params.user_id;
+        }
+
+        if (params.orgId) {
+          if (!oauth) oauth = {};
+          oauth.org_id = params.org_id;
         }
 
         // Load previously saved token
@@ -252,6 +254,10 @@ angular.module('forceng', [])
         queryString = url.substr(url.indexOf('#') + 1);
         obj = parseQueryString(queryString);
         oauth = obj;
+        // Paring out user id
+        var oauthId = oauth.id.split('/');
+        oauth.user_id = oauthId.pop();
+        oauth.org_id  = oauthId.pop();
         tokenStore['forceOAuth'] = JSON.stringify(oauth);
         if (deferredLogin) deferredLogin.resolve();
       } else if (url.indexOf("error=") > 0) {
@@ -292,16 +298,24 @@ angular.module('forceng', [])
 
     function loginWithPlugin() {
       document.addEventListener("deviceready", function () {
-        oauthPlugin = cordova.require("com.salesforce.plugin.oauth");
+        try {
+            oauthPlugin = cordova.require("com.salesforce.plugin.oauth");
+            networkPlugin = cordova.require("com.salesforce.plugin.network");
+        } catch(e) {
+            // fail silently
+        }        
         if (!oauthPlugin) {
           console.error('Salesforce Mobile SDK OAuth plugin not available');
           if (deferredLogin) deferredLogin.reject({status: 'Salesforce Mobile SDK OAuth plugin not available'});
           return;
         }
+        if (!networkPlugin) {
+          console.log('Salesforce Mobile SDK Network plugin not available');
+        }        
         oauthPlugin.getAuthCredentials(
           function (creds) {
             // Initialize ForceJS
-            init({accessToken: creds.accessToken, instanceURL: creds.instanceUrl, refreshToken: creds.refreshToken});
+            init({accessToken: creds.accessToken, instanceURL: creds.instanceUrl, refreshToken: creds.refreshToken, userId: creds.userId, orgId: creds.orgId});
             if (deferredLogin) deferredLogin.resolve();
           },
           function (error) {
@@ -326,8 +340,16 @@ angular.module('forceng', [])
      * @returns {string} | undefined
      */
     function getUserId() {
-      return (typeof(oauth) !== 'undefined') ? oauth.id.split('/').pop() : undefined;
+      return (typeof(oauth) !== 'undefined') ? oauth.user_id : undefined;
     }
+
+    /**
+     * Gets the user's Org ID (if logged in)
+     * @returns {string} | undefined
+     */
+    function getOrgId() {
+      return (typeof(oauth) !== 'undefined') ? oauth.org_id : undefined;
+    }    
 
     /**
      * Check the login status
@@ -643,6 +665,7 @@ angular.module('forceng', [])
       login: login,
       logout: logout,
       getUserId: getUserId,
+      getOrgId: getOrgId,
       isAuthenticated: isAuthenticated,
       request: request,
       query: query,
