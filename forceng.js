@@ -214,12 +214,12 @@ angular.module('forceng', [])
 
         if (params.userId) {
           if (!oauth) oauth = {};
-          oauth.user_id = params.user_id;
+          oauth.user_id = params.userId;
         }
 
         if (params.orgId) {
           if (!oauth) oauth = {};
-          oauth.org_id = params.org_id;
+          oauth.org_id = params.orgId;
         }
 
         // Load previously saved token
