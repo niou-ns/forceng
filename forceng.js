@@ -316,6 +316,11 @@ angular.module('forceng', [])
           function (creds) {
             // Initialize ForceJS
             init({accessToken: creds.accessToken, instanceURL: creds.instanceUrl, refreshToken: creds.refreshToken, userId: creds.userId, orgId: creds.orgId});
+            if (oauth) {
+              tokenStore['forceOAuth'] = JSON.stringify(oauth);
+            } else {
+              console.log('oauth object is not present');
+            }
             if (deferredLogin) deferredLogin.resolve();
           },
           function (error) {
