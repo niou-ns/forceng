@@ -1,7 +1,8 @@
 /**
  * ForceNG - REST toolkit for Salesforce.com
  * Author: Christophe Coenraets @ccoenraets
- * Version: 0.6.1
+ * Edited: Krzysztof Pintscher k.pintscher@polsource.com @niou-ns
+ * Version: 0.7
  */
 angular.module('forceng', [])
 
@@ -18,13 +19,13 @@ angular.module('forceng', [])
 
     // The force.com API version to use.
     // To override default, pass apiVersion in init(props)
-      apiVersion = 'v33.0',
+      apiVersion = 'v38.0',
 
     // Keep track of OAuth data (access_token, refresh_token, and instance_url)
       oauth,
 
-    // By default we store fbtoken in sessionStorage. This can be overridden in init()
-      tokenStore = {},
+    // By default we store token in sessionStorage. This can be overridden in init()
+      tokenStore = $window.sessionStorage,
 
     // if page URL is http://localhost:3000/myapp/index.html, context is /myapp
       context = window.location.pathname.substring(0, window.location.pathname.lastIndexOf("/")),
@@ -50,9 +51,15 @@ angular.module('forceng', [])
     // Reference to the Salesforce OAuth plugin
       oauthPlugin,
 
+    // Reference to the Salesforce Network plugin
+      networkPlugin,
+
+    // Where or not to use cordova for oauth and network calls
+      useCordova = window.cordova ? true : false,
+
     // Whether or not to use a CORS proxy. Defaults to false if app running in Cordova or in a VF page
     // Can be overriden in init()
-      useProxy = (window.cordova || window.SfdcApp) ? false : true;
+      useProxy = (window.cordova || window.SfdcApp || window.sforce) ? false : true;
 
     /*
      * Determines the request base URL.
@@ -99,7 +106,8 @@ angular.module('forceng', [])
       return parts.join("&");
     }
 
-    function refreshTokenWithPlugin(deferred) {
+    function refreshTokenWithPlugin() {
+      var deferred = $q.defer();
       oauthPlugin.authenticate(
         function (response) {
           oauth.access_token = response.accessToken;
@@ -110,16 +118,21 @@ angular.module('forceng', [])
           console.log('Error refreshing oauth access token using the oauth plugin');
           deferred.reject();
         });
+        return deferred.promise;
     }
 
-    function refreshTokenWithHTTPRequest(deferred) {
+    function refreshTokenWithHTTPRequest() {
+      var deferred = $q.defer();
       var params = {
           'grant_type': 'refresh_token',
           'refresh_token': oauth.refresh_token,
           'client_id': appId
         },
 
-        headers = {},
+        headers = {
+          'Content-Type': 'application/json',
+          'Target-URL': loginURL
+        },
 
         url = useProxy ? proxyURL : loginURL;
 
@@ -130,15 +143,11 @@ angular.module('forceng', [])
 
       url = url + '/services/oauth2/token?' + toQueryString(params);
 
-      if (!useProxy) {
-        headers["Target-URL"] = loginURL;
-      }
-
       $http({
         headers: headers,
         method: 'POST',
         url: url,
-        params: params
+        data: params
       })
         .success(function (data, status, headers, config) {
           console.log('Token refreshed');
@@ -150,16 +159,19 @@ angular.module('forceng', [])
           console.log('Error while trying to refresh token');
           deferred.reject();
         });
+        return deferred.promise;
     }
 
     function refreshToken() {
-      var deferred = $q.defer();
-      if (oauthPlugin) {
-        refreshTokenWithPlugin(deferred);
+      if (useCordova) {
+        if (!oauthPlugin) {
+          console.error('Salesforce Mobile SDK OAuth plugin not available');
+        } else {
+          return refreshTokenWithPlugin();
+        }
       } else {
-        refreshTokenWithHTTPRequest(deferred);
+        return refreshTokenWithHTTPRequest();
       }
-      return deferred.promise;
     }
 
     /**
@@ -175,6 +187,15 @@ angular.module('forceng', [])
      *  refreshToken (optional)
      */
     function init(params) {
+
+      if (useCordova) {
+        document.addEventListener("deviceready", function () {
+          networkPlugin = cordova.require("com.salesforce.plugin.network");
+          if (!networkPlugin) {
+            console.log('Salesforce Mobile SDK Network plugin not available');
+          }
+        });
+      }
 
       if (params) {
         appId = params.appId || appId;
@@ -198,6 +219,12 @@ angular.module('forceng', [])
           if (!oauth) oauth = {};
           oauth.refresh_token = params.refreshToken;
         }
+
+        // Load previously saved token
+        if (tokenStore['forceOAuth']) {
+          oauth = JSON.parse(tokenStore['forceOAuth']);
+        }
+
       }
 
       console.log("useProxy: " + useProxy);
@@ -217,7 +244,7 @@ angular.module('forceng', [])
      */
     function oauthCallback(url) {
 
-      // Parse the OAuth data received from Facebook
+      // Parse the OAuth data received from Salesforce
       var queryString,
         obj;
 
@@ -241,12 +268,26 @@ angular.module('forceng', [])
      */
     function login() {
       deferredLogin = $q.defer();
-      if (window.cordova) {
+      if (useCordova) {
         loginWithPlugin();
       } else {
         loginWithBrowser();
       }
       return deferredLogin.promise;
+    }
+
+    function logout() {
+      if (useCordova) {
+        oauthPlugin = cordova.require("com.salesforce.plugin.oauth");
+        if (!oauthPlugin) {
+          console.error('Salesforce Mobile SDK OAuth plugin not available');
+        } else {
+          oauthPlugin.logout();
+        }
+      } else {
+        tokenStore.removeItem('forceOAuth');
+        $window.location.reload();
+      }
     }
 
     function loginWithPlugin() {
@@ -297,6 +338,30 @@ angular.module('forceng', [])
     }
 
     /**
+     * @param path: full path or path relative to end point - required
+     * @param endPoint: undefined or endpoint - optional
+     * @return object with {endPoint:XX, path:relativePathToXX}
+     *
+     * For instance for undefined, '/services/data'     => {endPoint:'/services/data', path:'/'}
+     *                  undefined, '/services/apex/abc' => {endPoint:'/services/apex', path:'/abc'}
+     *                  '/services/data, '/versions'    => {endPoint:'/services/data', path:'/versions'}
+     */
+    function computeEndPointIfMissing(endPoint, path) {
+        if (endPoint !== undefined) {
+            return {endPoint:endPoint, path:path};
+        }
+        else {
+            var parts = path.split('/').filter(function(s) { return s !== ""; });
+            if (parts.length >= 2) {
+                return {endPoint: '/' + parts.slice(0,2).join('/'), path: '/' + parts.slice(2).join('/')};
+            }
+            else {
+                return {endPoint: '', path:path};
+            }
+        }
+    }
+
+    /**
      * Lets you make any Salesforce REST API request.
      * @param obj - Request configuration object. Can include:
      *  method:  HTTP method: GET, POST, etc. Optional - Default is 'GET'
@@ -304,8 +369,28 @@ angular.module('forceng', [])
      *  params:  queryString parameters as a map - Optional
      *  data:  JSON object to send in the request body - Optional
      */
-    function request(obj) {
 
+    function request(obj) {
+      // NB: networkPlugin will be defined only if login was done through plugin and container is using Mobile SDK 5.0 or above
+      if (networkPlugin) {
+          return requestWithPlugin(obj);
+      } else {
+          return requestWithBrowser(obj);
+      }
+    }
+
+    function requestWithPlugin(obj) {
+      var deferred = $q.defer();
+      Object.assign(obj, computeEndPointIfMissing(obj.endPoint, obj.path));
+      networkPlugin.sendRequest(obj.endPoint, obj.path, function(result) {
+        deferred.resolve(result);
+      }, function(result) {
+        deferred.reject(result);
+      }, obj.method, obj.data || obj.params, obj.headerParams);
+      return deferred.promise
+    }
+
+    function requestWithBrowser(obj) {
       var method = obj.method || 'GET',
         headers = {},
         url = getRequestBaseURL(),
@@ -344,14 +429,13 @@ angular.module('forceng', [])
         .error(function (data, status, headers, config) {
           if (status === 401 && oauth.refresh_token) {
             refreshToken()
-              .success(function () {
+              .then(function () {
                 // Try again with the new token
-                request(obj);
-              })
-              .error(function () {
+                return request(obj);
+              }, function (data) {
                 console.error(data);
                 deferred.reject(data);
-              });
+              })
           } else {
             console.error(data);
             deferred.reject(data);
@@ -519,15 +603,52 @@ angular.module('forceng', [])
 
     }
 
+    /**
+    * Create a SObject Tree
+    * @param data
+    * @returns {*}
+    */
+    function createTree(data) {
+
+      return request({
+        method: 'POST',
+        contentType: 'application/json',
+        path: '/services/data/' + apiVersion + '/composite/tree',
+        data: data
+      });
+
+    }
+
+    /**
+    * Create a Batch Requests
+    * @param data
+    * @returns {*}
+    */
+    function createBatchRequests(data) {
+
+      return request({
+        method: 'POST',
+        contentType: 'application/json',
+        path: '/services/data/' + apiVersion + '/composite/batch',
+        data: {
+          batchRequests: data
+        }
+      });
+
+    }    
+
     // The public API
     return {
       init: init,
       login: login,
+      logout: logout,
       getUserId: getUserId,
       isAuthenticated: isAuthenticated,
       request: request,
       query: query,
       create: create,
+      createTree: createTree,
+      createBatchRequests: createBatchRequests,      
       update: update,
       del: del,
       upsert: upsert,
