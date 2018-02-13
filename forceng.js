@@ -2,11 +2,11 @@
  * ForceNG - REST toolkit for Salesforce.com
  * Author: Christophe Coenraets @ccoenraets
  * Edited: Krzysztof Pintscher k.pintscher@polsource.com @niou-ns
- * Version: 0.7
+ * Version: 0.8
  */
 angular.module('forceng', [])
 
-  .factory('force', function ($rootScope, $q, $window, $http) {
+  .factory('force', function ($rootScope, $q, $window, $http, $httpParamSerializer, $timeout) {
 
     // The login URL for the OAuth process
     // To override default, pass loginURL in init(props)
@@ -59,7 +59,9 @@ angular.module('forceng', [])
 
     // Whether or not to use a CORS proxy. Defaults to false if app running in Cordova or in a VF page
     // Can be overriden in init()
-      useProxy = (window.cordova || window.SfdcApp || window.sforce) ? false : true;
+      useProxy = (window.cordova || window.SfdcApp || window.sforce) ? false : true,
+
+      retry = false;
 
     /*
      * Determines the request base URL.
@@ -227,6 +229,19 @@ angular.module('forceng', [])
           oauth = JSON.parse(tokenStore['forceOAuth']);
         }
 
+        if (useCordova) {
+          document.addEventListener("deviceready", function () {
+            try {
+                networkPlugin = cordova.require("com.salesforce.plugin.network");
+            } catch(e) {
+                // fail silently
+            }
+            if (!networkPlugin) {
+              console.log('Salesforce Mobile SDK Network plugin not available');
+            }
+          });
+        }
+
       }
 
       console.log("useProxy: " + useProxy);
@@ -291,7 +306,7 @@ angular.module('forceng', [])
           oauthPlugin.logout();
         }
       } else {
-        tokenStore.removeItem('forceOAuth');
+        tokenStore.clear();
         $window.location.reload();
       }
     }
@@ -300,18 +315,14 @@ angular.module('forceng', [])
       document.addEventListener("deviceready", function () {
         try {
             oauthPlugin = cordova.require("com.salesforce.plugin.oauth");
-            networkPlugin = cordova.require("com.salesforce.plugin.network");
         } catch(e) {
             // fail silently
-        }        
+        }
         if (!oauthPlugin) {
           console.error('Salesforce Mobile SDK OAuth plugin not available');
           if (deferredLogin) deferredLogin.reject({status: 'Salesforce Mobile SDK OAuth plugin not available'});
           return;
         }
-        if (!networkPlugin) {
-          console.log('Salesforce Mobile SDK Network plugin not available');
-        }        
         oauthPlugin.getAuthCredentials(
           function (creds) {
             // Initialize ForceJS
@@ -354,14 +365,67 @@ angular.module('forceng', [])
      */
     function getOrgId() {
       return (typeof(oauth) !== 'undefined') ? oauth.org_id : undefined;
-    }    
+    }
+
+    function getSFAccountManager() {
+      return cordova.require('com.salesforce.plugin.sfaccountmanager');
+    }
+
+    function getCurrentUser() {
+      var deferred = $q.defer();
+      if (useCordova) {
+        var sfAccountManager = getSFAccountManager();
+        sfAccountManager.getCurrentUser(function(result) {
+          deferred.resolve(result);
+        }, function(error) {
+          deferred.reject(error);
+        })
+      } else {
+        chatter({path: '/users/me'})
+          .then(function(result) {
+            deferred.resolve(result);
+          }, function(error) {
+            deferred.reject(error);
+          });
+      }
+      return deferred.promise;
+    }
+
+    function getInstanceUrl() {
+      return oauth.instance_url ? oauth.instance_url : ((useProxy && proxyURL) ? proxyURL.replace('my.salesforce', 'content.force') : '');
+    }
 
     /**
      * Check the login status
      * @returns {boolean}
      */
     function isAuthenticated() {
-      return (oauth && oauth.access_token) ? true : false;
+      var deferred = $q.defer();
+      if (useCordova) {
+        oauthPlugin = cordova.require("com.salesforce.plugin.oauth");
+        if (!oauthPlugin) {
+          console.error('Salesforce Mobile SDK OAuth plugin not available');
+        } else {
+          oauthPlugin.authenticate(function(creds) {
+            init({accessToken: creds.accessToken, instanceURL: creds.instanceUrl, refreshToken: creds.refreshToken, userId: creds.userId, orgId: creds.orgId});
+            if (oauth) {
+              tokenStore['forceOAuth'] = JSON.stringify(oauth);
+            } else {
+              console.log('oauth object is not present');
+            }
+            deferred.resolve();
+          },
+          function(error) {
+            // Remove current session - try to login again
+            oauthPlugin.logout();
+            // Kill the page
+            // deferred.reject(error);
+          });
+        }
+      } else {
+        (oauth && oauth.access_token) ? deferred.resolve() : deferred.reject();
+      }
+      return deferred.promise;
     }
 
     /**
@@ -398,34 +462,81 @@ angular.module('forceng', [])
      */
 
     function request(obj) {
-      // NB: networkPlugin will be defined only if login was done through plugin and container is using Mobile SDK 5.0 or above
+      var d = new Date();
+      var id = d.getTime() + Math.random().toString(36).substring(2,5);
+      $rootScope.$broadcast('$requestStarted', {id: id});
+      // NB: networkPlugin will be defined only if plugin was detected on init
       if (networkPlugin) {
-          return requestWithPlugin(obj);
+          return requestWithPlugin(obj, id);
       } else {
-          return requestWithBrowser(obj);
+          return requestWithBrowser(obj, id);
       }
     }
 
-    function requestWithPlugin(obj) {
+    var _refreshTokenInitialized = false;
+    var _blockedRequests = [];
+
+    function requestWithPlugin(obj, id) {
       var deferred = $q.defer();
       Object.assign(obj, computeEndPointIfMissing(obj.endPoint, obj.path));
+
+      if (obj.params && obj.path.indexOf('?') === -1) {
+        obj.path += '?' + $httpParamSerializer(obj.params);
+      }
+
       networkPlugin.sendRequest(obj.endPoint, obj.path, function(result) {
+        $rootScope.$broadcast('$requestCompleted', {id: id});
+        if (result.notifications && result.notifications.length > 0) {
+          for (var i = 0, j = result.notifications.length; i < j; i++) {
+            if (result.notifications[i].level !== '' && result.notifications[i].message !== '') {
+              $rootScope.$broadcast('$showNotification', {'level': result.notifications[i].level, 'message': result.notifications[i].message});
+            }
+          }
+        }
         deferred.resolve(result);
       }, function(result) {
-        deferred.reject(result);
-      }, obj.method, obj.data || obj.params, obj.headerParams);
+        // Token got revoked?
+        if (result === 'Instance URL is null') {
+          _blockedRequests.push({obj: obj, id: id, deferred: deferred});
+          if (!_refreshTokenInitialized) {
+            _refreshTokenInitialized = true;
+            refreshTokenWithPlugin()
+              .then(() => {
+                _refreshTokenInitialized = false;
+                _blockedRequests.forEach(function(request){
+                  request.deferred.resolve(requestWithPlugin(request.obj, request.id));
+                });
+                _blockedRequests = [];
+              });
+          }
+        } else {
+          $rootScope.$broadcast('$requestCompleted', {id: id});
+          deferred.reject(result);
+        }
+      }, obj.method, obj.data, obj.headerParams);
       return deferred.promise
     }
 
-    function requestWithBrowser(obj) {
+    function requestWithBrowser(obj, id) {
       var method = obj.method || 'GET',
         headers = {},
         url = getRequestBaseURL(),
-        deferred = $q.defer();
+        deferred = $q.defer(),
+        responseType = obj.responseType;
 
       if (!oauth || (!oauth.access_token && !oauth.refresh_token)) {
-        deferred.reject('No access token. Login and try again.');
-        return deferred.promise;
+        if (!retry) {
+          retry = true;
+          console.log("%c forceng: First try, might be missing access token or 'init' wasn't completed yet. Let's try again. ", 'background: #000; color: #bada55');
+          $timeout(function(){
+            deferred.resolve(requestWithBrowser(obj, id));
+          });
+          return deferred.promise;
+        } else {
+          deferred.reject('No access token. Login and try again.');
+          $rootScope.$broadcast('$requestCompleted', {id: id});
+          return deferred.promise;
+        }
       }
 
       // dev friendly API: Add leading '/' if missing so url + path concat always works
@@ -433,7 +544,11 @@ angular.module('forceng', [])
         obj.path = '/' + obj.path;
       }
 
-      url = url + obj.path;
+      if (!obj.ignoreUrl) {
+        url = url + obj.path;
+      } else {
+        url = obj.url;
+      }
 
       headers["Authorization"] = "Bearer " + oauth.access_token;
       if (obj.contentType) {
@@ -448,21 +563,34 @@ angular.module('forceng', [])
         method: method,
         url: url,
         params: obj.params,
-        data: obj.data
+        data: obj.data,
+        responseType: responseType
       })
         .success(function (data, status, headers, config) {
+          $rootScope.$broadcast('$requestCompleted', {id: id});
           deferred.resolve(data);
         })
         .error(function (data, status, headers, config) {
+          $rootScope.$broadcast('$requestCompleted', {id: id});
           if (status === 401 && oauth.refresh_token) {
             refreshToken()
-              .then(function () {
-                // Try again with the new token
-                return request(obj);
-              }, function (data) {
-                console.error(data);
-                deferred.reject(data);
-              })
+                .then(function () {
+                    // Try again with the new token
+                    deferred.resolve(request(obj));
+                  }, function () {
+                    // New token failed, let's try to log in
+                    delete tokenStore['forceOAuth'];
+                    login().then(function(){
+                      deferred.resolve(request(obj));
+                    }, function() {
+                      // Everything failed, throw error
+                      console.error(data);
+                      deferred.reject(data);
+                    });
+                });
+          } else if (status === -1) {
+            // Probably VF Session got expired
+            logout();
           } else {
             console.error(data);
             deferred.reject(data);
@@ -662,7 +790,38 @@ angular.module('forceng', [])
         }
       });
 
-    }    
+    }
+
+    /**
+    * Create single Batch Request body
+    * @param {String} url
+    * @param {String} method
+    * @param {Object} data
+    * @returns {Object}
+    */
+    function createBatchRequest(url, method, data) {
+      if (url.charAt(0) !== "/") {
+        url = "/" + url;
+      }
+      url = apiVersion + url
+      return {
+        url: url,
+        method: method,
+        richInput: data
+      };
+    };
+
+    function createVFRequest(url) {
+      return oauth.instance_url + '/secur/frontdoor.jsp?sid=' + oauth.access_token + '&retURL=' + url;
+    }
+
+    function getApiVersion() {
+      return apiVersion;
+    }
+
+    function getToken() {
+      return oauth.access_token;
+    }
 
     // The public API
     return {
@@ -671,12 +830,19 @@ angular.module('forceng', [])
       logout: logout,
       getUserId: getUserId,
       getOrgId: getOrgId,
+      getCurrentUser: getCurrentUser,
+      getInstanceUrl: getInstanceUrl,
+      getApiVersion: getApiVersion,
+      getToken: getToken,
       isAuthenticated: isAuthenticated,
       request: request,
+      requestWithBrowser: requestWithBrowser,
       query: query,
       create: create,
       createTree: createTree,
-      createBatchRequests: createBatchRequests,      
+      createBatchRequests: createBatchRequests,
+      createBatchRequest: createBatchRequest,
+      createVFRequest: createVFRequest,
       update: update,
       del: del,
       upsert: upsert,
